@@ -16,6 +16,7 @@ import dynamic from 'next/dynamic';
 import AIProcessingLoader from '@/components/AIProcessingLoader';
 import CameraCapture from '@/components/CameraCapture';
 import DownloadReportButton from '@/components/DownloadReportButton';
+import { compressImage, validateImageFile } from '@/lib/utils/imageCompression';
 
 const MapPreview = dynamic(() => import('@/components/MapPreview'), {
   ssr: false,
@@ -184,20 +185,59 @@ export default function AssetUploadZone() {
   const { scoreSubmission, isScoring, error: scoringError } = useFraudScoring();
 
   useEffect(() => {
-    if (scoringError) toast.error(scoringError);
+    if (scoringError) {
+      // Map raw error strings to professional UI messages
+      const lower = scoringError.toLowerCase();
+      let friendlyMsg = 'AI verification temporarily unavailable. Please retry.';
+      if (lower.includes('too large') || lower.includes('photo')) {
+        friendlyMsg = 'Photo size too large. Please use a smaller image.';
+      } else if (lower.includes('network') || lower.includes('fetch')) {
+        friendlyMsg = 'Network error — please check your connection and retry.';
+      } else if (lower.includes('busy') || lower.includes('429')) {
+        friendlyMsg = 'Server busy. Trying fallback verification...';
+      } else if (lower.includes('timeout')) {
+        friendlyMsg = 'Verification timed out. Please retry.';
+      } else if (lower.includes('configuration') || lower.includes('api key')) {
+        friendlyMsg = 'AI service configuration issue. Please contact support.';
+      }
+      toast.error(friendlyMsg);
+    }
   }, [scoringError]);
 
-  const handleFile = useCallback((file: File) => {
-    if (!file.type.startsWith('image/')) {
-      toast.error('Only image files are supported. Please upload a JPG, PNG, or WEBP file.');
+  const handleFile = useCallback(async (file: File) => {
+    // Validate file type and size
+    const validationError = validateImageFile(file);
+    if (validationError) {
+      toast.error(validationError);
       return;
     }
-    if (file.size > 10 * 1024 * 1024) {
-      toast.error('File size exceeds 10MB. Please compress the image and try again.');
-      return;
+
+    // Compress if needed — prevents Gemini 400 "payload too large" errors
+    let processedFile = file;
+    try {
+      if (file.size > 500 * 1024) {
+        toast.info('Optimizing photo for upload...');
+        const result = await compressImage(file, {
+          maxDimension: 1024,
+          quality: 0.82,
+          maxBytes: 850_000,
+        });
+        processedFile = result.file;
+        if (result.wasCompressed) {
+          console.log(
+            `[Upload] Compressed: ${(file.size / 1024).toFixed(0)}KB to ` +
+            `${(processedFile.size / 1024).toFixed(0)}KB`
+          );
+        }
+      }
+    } catch (compressionErr) {
+      // Compression failed safely — proceed with original file
+      console.warn('[Upload] Compression skipped:', compressionErr);
+      processedFile = file;
     }
-    setSelectedFile(file);
-    const url = URL.createObjectURL(file);
+
+    setSelectedFile(processedFile);
+    const url = URL.createObjectURL(processedFile);
     setPreviewUrl(url);
     captureGPS();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
