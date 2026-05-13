@@ -1,4 +1,13 @@
-import { getChatCompletion } from './chatCompletion';
+/**
+ * fraudScoring.ts — Hardened AI fraud scoring engine
+ *
+ * Changes from original:
+ * 1. Uses new /api/ai/verify-asset route (direct Gemini REST, no LiteLLM)
+ * 2. Strips image if base64 > 900KB to prevent Gemini 400 errors
+ * 3. Comprehensive fallback mock response when AI fails
+ * 4. Proper TypeScript types — no unsafe `any`
+ * 5. Detailed server/client logging
+ */
 
 export interface FraudScoringInput {
   assetCategory: string;
@@ -28,7 +37,10 @@ export interface FraudScoringResult {
   metadataFlags: string[];
   summary: string;
   recommendation: 'Approve' | 'Manual Review' | 'Reject';
+  isFallback?: boolean;
 }
+
+// ─── GPS helpers ──────────────────────────────────────────────────────────────
 
 function computeGpsVarianceKm(
   a: { lat: number; lng: number },
@@ -54,295 +66,239 @@ function buildMetadataFlags(input: FraudScoringInput): string[] {
     const { fileSize, lastModified } = input.imageMetadata;
     if (fileSize < 50 * 1024) flags.push('Image file size unusually small (<50KB)');
     if (lastModified) {
-      const ageMs = Date.now() - lastModified;
-      const ageDays = ageMs / (1000 * 60 * 60 * 24);
-      if (ageDays > 365) flags.push('Image file is older than 1 year');
+      const ageDays = (Date.now() - lastModified) / (1000 * 60 * 60 * 24);
       if (ageDays > 730) flags.push('Image file is older than 2 years — high risk');
+      else if (ageDays > 365) flags.push('Image file is older than 1 year');
     }
   }
   if (input.gpsCoords && input.gpsExpectedCoords) {
     const dist = computeGpsVarianceKm(input.gpsCoords, input.gpsExpectedCoords);
-    if (dist > 50) flags.push(`GPS variance ${dist.toFixed(1)}km — far from loan disbursement site`);
-    else if (dist > 10) flags.push(`GPS variance ${dist.toFixed(1)}km — moderate distance from loan site`);
+    if (dist > 50) flags.push(`GPS variance ${dist.toFixed(1)}km — far from loan site`);
+    else if (dist > 10) flags.push(`GPS variance ${dist.toFixed(1)}km — moderate distance`);
   }
   return flags;
 }
 
-/**
- * Extracts the text content from various AI response shapes:
- * - OpenAI: response.choices[0].message.content
- * - Gemini via SDK: response.choices[0].message.content OR response.candidates[0].content.parts[0].text
- * - Plain string
- */
-function extractContentFromResponse(response: any): string | null {
-  if (!response) return null;
+// ─── Fallback mock response ───────────────────────────────────────────────────
 
-  // Standard OpenAI / LiteLLM shape
-  const choiceContent = response?.choices?.[0]?.message?.content;
-  if (typeof choiceContent === 'string' && choiceContent.trim()) {
-    return choiceContent.trim();
-  }
-
-  // Gemini native shape: candidates[0].content.parts[0].text
-  const candidateText = response?.candidates?.[0]?.content?.parts?.[0]?.text;
-  if (typeof candidateText === 'string' && candidateText.trim()) {
-    return candidateText.trim();
-  }
-
-  // Gemini alternate: candidates[0].content.parts as array
-  const parts = response?.candidates?.[0]?.content?.parts;
-  if (Array.isArray(parts)) {
-    const textPart = parts.find((p: any) => typeof p?.text === 'string');
-    if (textPart?.text?.trim()) return textPart.text.trim();
-  }
-
-  // Fallback: if response itself is a string
-  if (typeof response === 'string' && response.trim()) {
-    return response.trim();
-  }
-
-  // Last resort: check for text property at top level
-  if (typeof response?.text === 'string' && response.text.trim()) {
-    return response.text.trim();
-  }
-
-  return null;
+function buildFallbackResult(input: FraudScoringInput): FraudScoringResult {
+  console.warn('[FraudScoring] Using fallback mock result — AI unavailable');
+  return {
+    fraudScore: 45,
+    riskLevel: 'Medium',
+    assetDetected: input.assetCategory,
+    confidenceScore: 72,
+    gpsVariance: input.gpsCoords
+      ? `${input.gpsCoords.lat.toFixed(4)}N, ${input.gpsCoords.lng.toFixed(4)}E`
+      : 'GPS not available',
+    gpsMatchStatus: input.gpsCoords ? 'Unable to Verify' : 'Unable to Verify',
+    ocrInvoiceMatch: 'Manual verification required',
+    ocrMatchStatus: 'Not Available',
+    duplicateCheckStatus: 'Clean',
+    metadataFlags: buildMetadataFlags(input),
+    summary:
+      'AI verification temporarily unavailable. Submission flagged for manual officer review.',
+    recommendation: 'Manual Review',
+    isFallback: true,
+  };
 }
 
-/**
- * Robustly extracts a JSON object from AI text output.
- * Handles: raw JSON, markdown fences (```json ... ```), embedded JSON objects, and truncated JSON.
- */
-function extractJsonFromText(text: string): Record<string, any> {
-  const cleaned = text.trim();
+// ─── AI field validators ──────────────────────────────────────────────────────
 
-  // 1. Try direct parse
-  try {
-    let parsed = JSON.parse(cleaned);
-    if (parsed && typeof parsed === 'object') return parsed;
-  } catch { /* continue */ }
+const RISK_LEVELS = ['Low', 'Medium', 'High', 'Critical'] as const;
+const GPS_STATUSES = ['Verified', 'Mismatch', 'Unable to Verify'] as const;
+const OCR_STATUSES = ['Success', 'Partial', 'Failed', 'Not Available'] as const;
+const DUP_STATUSES = ['Clean', 'Suspicious', 'Duplicate Detected'] as const;
+const RECOMMENDATIONS = ['Approve', 'Manual Review', 'Reject'] as const;
 
-  // 2. Strip markdown code fences: ```json ... ``` or ``` ... ```
-  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch) {
-    try {
-      let parsed = JSON.parse(fenceMatch[1].trim());
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch { /* continue */ }
-  }
-
-  // 3. Find the outermost JSON object using brace matching (handles nested objects)
-  const firstBrace = cleaned.indexOf('{');
-  const lastBrace = cleaned.lastIndexOf('}');
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    const candidate = cleaned.slice(firstBrace, lastBrace + 1);
-    try {
-      let parsed = JSON.parse(candidate);
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch { /* continue */ }
-  }
-
-  // 4. Try to fix common JSON issues: trailing commas, single quotes
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    const candidate = cleaned
-      .slice(firstBrace, lastBrace + 1)
-      .replace(/,\s*([}\]])/g, '$1')   // remove trailing commas
-      .replace(/'/g, '"');              // replace single quotes with double
-    try {
-      let parsed = JSON.parse(candidate);
-      if (parsed && typeof parsed === 'object') return parsed;
-    } catch { /* continue */ }
-  }
-
-  // 5. Handle truncated JSON: response was cut off mid-stream (token limit hit)
-  // Strategy: find the last complete key-value pair, close any open string, then close the object
-  if (firstBrace !== -1) {
-    let truncated = cleaned.slice(firstBrace);
-
-    // Close any open string: if there's an odd number of unescaped quotes after the last comma,
-    // the last value is an unterminated string — close it first
-    const lastComma = truncated.lastIndexOf(',');
-    const afterLastComma = lastComma !== -1 ? truncated.slice(lastComma) : truncated;
-    const unescapedQuotes = (afterLastComma.match(/(?<!\\)"/g) || []).length;
-    if (unescapedQuotes % 2 !== 0) {
-      // Odd number of quotes → open string; close it, then close the object
-      truncated = truncated + '"';
-    }
-
-    // Now strip the last incomplete key-value pair if it still won't parse
-    // by trimming back to the last comma
-    if (lastComma !== -1) {
-      const withoutLast = truncated.slice(0, lastComma) + '}';
-      const fixed = withoutLast
-        .replace(/,\s*([}\]])/g, '$1')
-        .replace(/'/g, '"');
-      try {
-        let parsed = JSON.parse(fixed);
-        if (parsed && typeof parsed === 'object') {
-          console.warn('Recovered partial JSON (truncated last field). Some fields may use defaults.');
-          return parsed;
-        }
-      } catch { /* continue */ }
-    }
-
-    // Try closing the object as-is (after string close)
-    const closed = truncated + '}';
-    const fixed = closed
-      .replace(/,\s*([}\]])/g, '$1')
-      .replace(/'/g, '"');
-    try {
-      let parsed = JSON.parse(fixed);
-      if (parsed && typeof parsed === 'object') {
-        console.warn('Recovered partial JSON from truncated AI response. Some fields may use defaults.');
-        return parsed;
-      }
-    } catch { /* continue */ }
-  }
-
-  throw new Error(`Could not parse AI response as JSON. Raw response: ${text.slice(0, 200)}`);
+function validateResult(
+  parsed: Record<string, unknown>,
+  input: FraudScoringInput,
+  gpsVarianceText: string,
+  gpsMatchStatus: FraudScoringResult['gpsMatchStatus'],
+  metadataFlags: string[]
+): FraudScoringResult {
+  return {
+    fraudScore:
+      typeof parsed.fraudScore === 'number'
+        ? Math.min(100, Math.max(0, parsed.fraudScore))
+        : 50,
+    riskLevel: RISK_LEVELS.includes(parsed.riskLevel as (typeof RISK_LEVELS)[number])
+      ? (parsed.riskLevel as FraudScoringResult['riskLevel'])
+      : 'Medium',
+    assetDetected:
+      typeof parsed.assetDetected === 'string' && parsed.assetDetected
+        ? parsed.assetDetected
+        : input.assetCategory,
+    confidenceScore:
+      typeof parsed.confidenceScore === 'number'
+        ? Math.min(100, Math.max(0, parsed.confidenceScore))
+        : 70,
+    gpsVariance: gpsVarianceText,
+    gpsMatchStatus,
+    ocrInvoiceMatch:
+      typeof parsed.ocrInvoiceMatch === 'string' && parsed.ocrInvoiceMatch
+        ? parsed.ocrInvoiceMatch
+        : 'Not analyzed',
+    ocrMatchStatus: OCR_STATUSES.includes(parsed.ocrMatchStatus as (typeof OCR_STATUSES)[number])
+      ? (parsed.ocrMatchStatus as FraudScoringResult['ocrMatchStatus'])
+      : 'Not Available',
+    duplicateCheckStatus: DUP_STATUSES.includes(
+      parsed.duplicateCheckStatus as (typeof DUP_STATUSES)[number]
+    )
+      ? (parsed.duplicateCheckStatus as FraudScoringResult['duplicateCheckStatus'])
+      : 'Clean',
+    metadataFlags: Array.from(
+      new Set([
+        ...metadataFlags,
+        ...(Array.isArray(parsed.metadataFlags)
+          ? (parsed.metadataFlags as unknown[]).filter((f): f is string => typeof f === 'string')
+          : []),
+      ])
+    ),
+    summary:
+      typeof parsed.summary === 'string' && parsed.summary
+        ? parsed.summary
+        : 'AI assessment completed. Please review the submission manually.',
+    recommendation: RECOMMENDATIONS.includes(
+      parsed.recommendation as (typeof RECOMMENDATIONS)[number]
+    )
+      ? (parsed.recommendation as FraudScoringResult['recommendation'])
+      : 'Manual Review',
+    isFallback: !!(parsed.isFallback),
+  };
 }
+
+// ─── Main scoring function ────────────────────────────────────────────────────
+
+// Maximum base64 size we'll send to Gemini (~900KB compressed)
+const MAX_IMAGE_BASE64_BYTES = 900 * 1024;
 
 export async function runFraudScoring(
   input: FraudScoringInput
 ): Promise<FraudScoringResult> {
   const metadataFlags = buildMetadataFlags(input);
 
+  // ── Compute GPS variance ──────────────────────────────────────────────────
   let gpsVarianceText = 'GPS not available';
   let gpsMatchStatus: FraudScoringResult['gpsMatchStatus'] = 'Unable to Verify';
+
   if (input.gpsCoords && input.gpsExpectedCoords) {
     const dist = computeGpsVarianceKm(input.gpsCoords, input.gpsExpectedCoords);
     gpsVarianceText = `${dist.toFixed(2)}km from loan disbursement site`;
     gpsMatchStatus = dist <= 20 ? 'Verified' : 'Mismatch';
   } else if (input.gpsCoords) {
-    gpsVarianceText = `${input.gpsCoords.lat.toFixed(4)}N, ${input.gpsCoords.lng.toFixed(4)}E — no reference point`;
+    gpsVarianceText = `${input.gpsCoords.lat.toFixed(4)}N, ${input.gpsCoords.lng.toFixed(4)}E`;
     gpsMatchStatus = 'Unable to Verify';
   }
 
-  const systemPrompt = `You are an AI fraud detection engine for a government loan utilization verification platform called LoanLens AI.
-Your task is to analyze beneficiary asset submission data and produce a structured fraud risk assessment.
-CRITICAL INSTRUCTION: You must respond with ONLY a valid JSON object. Do NOT use markdown formatting, do NOT use code fences, do NOT add any explanation or text before or after the JSON. Start your response with { and end with }.`;
+  // ── Build prompt ──────────────────────────────────────────────────────────
+  const prompt = `You are an AI fraud detection engine for LoanLens AI (a government loan verification platform).
+Analyze this beneficiary asset submission and return ONLY a valid JSON object.
+Do NOT use markdown, code fences, or any text outside the JSON object.
 
-  const userPrompt = `Analyze the following beneficiary asset submission for fraud risk:
+SUBMISSION DATA:
+- Asset Category: ${input.assetCategory}
+- GPS: ${input.gpsCoords ? `${input.gpsCoords.lat.toFixed(6)}N, ${input.gpsCoords.lng.toFixed(6)}E` : 'Not captured'}
+- GPS Variance: ${gpsVarianceText}
+- OCR Text: ${input.ocrText ?? 'Not available'}
+- Loan Amount: ${input.loanAmount ? `Rs.${input.loanAmount}` : 'Not provided'}
+- Image Metadata Flags: ${metadataFlags.length > 0 ? metadataFlags.join('; ') : 'None'}
+- File: ${input.imageMetadata ? `${input.imageMetadata.fileName} (${(input.imageMetadata.fileSize / 1024).toFixed(1)}KB, ${input.imageMetadata.fileType})` : 'Not available'}
 
-ASSET CATEGORY: ${input.assetCategory}
-GPS COORDINATES: ${input.gpsCoords ? `${input.gpsCoords.lat.toFixed(6)}N, ${input.gpsCoords.lng.toFixed(6)}E` : 'Not captured'}
-GPS VARIANCE: ${gpsVarianceText}
-OCR EXTRACTED TEXT: ${input.ocrText || 'Not available'}
-LOAN AMOUNT: ${input.loanAmount ? `Rs.${input.loanAmount}` : 'Not provided'}
-IMAGE METADATA FLAGS: ${metadataFlags.length > 0 ? metadataFlags.join('; ') : 'None detected'}
-IMAGE FILE: ${input.imageMetadata ? `${input.imageMetadata.fileName} (${(input.imageMetadata.fileSize / 1024).toFixed(1)}KB, ${input.imageMetadata.fileType})` : 'Not available'}
+Respond with ONLY this JSON (replace all values with your analysis):
+{"fraudScore":45,"riskLevel":"Medium","assetDetected":"Tractor (detected in photo)","confidenceScore":85,"gpsVariance":"coordinates recorded","gpsMatchStatus":"Unable to Verify","ocrInvoiceMatch":"Invoice not available","ocrMatchStatus":"Not Available","duplicateCheckStatus":"Clean","metadataFlags":[],"summary":"Submission looks legitimate but GPS reference unavailable.","recommendation":"Manual Review"}
 
-Respond with ONLY this JSON object (no markdown, no code fences, no extra text):
-{"fraudScore":50,"riskLevel":"Medium","assetDetected":"short description","confidenceScore":75,"gpsVariance":"short summary max 60 chars","gpsMatchStatus":"Unable to Verify","ocrInvoiceMatch":"short summary","ocrMatchStatus":"Not Available","duplicateCheckStatus":"Clean","metadataFlags":[],"summary":"1-2 sentence summary","recommendation":"Manual Review"}
+RULES:
+- fraudScore: integer 0-100
+- riskLevel: "Low"|"Medium"|"High"|"Critical"
+- gpsMatchStatus: "Verified"|"Mismatch"|"Unable to Verify"
+- ocrMatchStatus: "Success"|"Partial"|"Failed"|"Not Available"
+- duplicateCheckStatus: "Clean"|"Suspicious"|"Duplicate Detected"
+- recommendation: "Approve"|"Manual Review"|"Reject"
+- gpsVariance: max 60 chars
+- summary: max 150 chars`;
 
-Replace all values with your actual analysis. STRICT RULES:
-- fraudScore: integer 0-100 (0-20=Low, 21-50=Medium, 51-75=High, 76-100=Critical)
-- riskLevel: EXACTLY one of: "Low", "Medium", "High", "Critical" - gpsMatchStatus: EXACTLY one of:"Verified", "Mismatch", "Unable to Verify"
-- ocrMatchStatus: EXACTLY one of: "Success", "Partial", "Failed", "Not Available" - duplicateCheckStatus: EXACTLY one of:"Clean", "Suspicious", "Duplicate Detected" - recommendation: EXACTLY one of:"Approve", "Manual Review", "Reject"
-- metadataFlags: array of short strings (can be empty [])
-- gpsVariance: KEEP UNDER 60 CHARACTERS — e.g. "795km mismatch — high risk" NOT a long sentence
-- assetDetected: KEEP UNDER 80 CHARACTERS
-- ocrInvoiceMatch: KEEP UNDER 80 CHARACTERS
-- summary: KEEP UNDER 150 CHARACTERS
-- If GPS variance is over 50km, increase fraud score significantly
-- When in doubt, use "Manual Review" as recommendation`;
-
-  // Build messages with optional image
-  const userContent: any[] = [{ type: 'text', text: userPrompt }];
-
+  // ── Determine if we should include the image ──────────────────────────────
+  let imageToSend: string | null = null;
   if (input.imageBase64) {
-    const match = input.imageBase64.match(/^data:([^;]+);base64,(.+)$/);
-    if (match) {
-      const mimeType = match[1];
-      const base64Data = match[2];
-      userContent.push({
-        type: 'image_url',
-        image_url: {
-          url: `data:${mimeType};base64,${base64Data}`,
-        },
-      });
-    }
-  }
-
-  const messages: Array<{ role: 'system' | 'user'; content: any }> = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: input.imageBase64 ? userContent : userPrompt },
-  ];
-
-  let response: any;
-  try {
-    response = await getChatCompletion('GEMINI', 'gemini/gemini-2.5-flash', messages, {
-      max_tokens: 2000,
-    });
-  } catch (e: any) {
-    const msg: string = e?.message || '';
-    const isTransient =
-      msg.includes('503') ||
-      msg.includes('502') ||
-      msg.includes('529') ||
-      msg.includes('overloaded') ||
-      msg.includes('unavailable') ||
-      msg.includes('Service Unavailable');
-    if (isTransient) {
-      console.warn('gemini-2.5-flash unavailable, falling back to gemini-1.5-flash...');
-      response = await getChatCompletion('GEMINI', 'gemini/gemini-1.5-flash', messages, {
-        max_tokens: 2000,
-      });
+    const base64Bytes = input.imageBase64.length * 0.75;
+    if (base64Bytes <= MAX_IMAGE_BASE64_BYTES) {
+      imageToSend = input.imageBase64;
+      console.log(
+        `[FraudScoring] Including image in request (~${(base64Bytes / 1024).toFixed(0)}KB)`
+      );
     } else {
-      throw e;
+      console.warn(
+        `[FraudScoring] Image too large (~${(base64Bytes / 1024).toFixed(0)}KB) — using text-only mode`
+      );
     }
   }
 
-  // Extract text content from whatever shape the response comes in
-  const raw = extractContentFromResponse(response);
+  // ── Call verify-asset API route ───────────────────────────────────────────
+  console.log('[FraudScoring] Calling /api/ai/verify-asset', {
+    assetCategory: input.assetCategory,
+    hasImage: !!imageToSend,
+    gpsAvailable: !!input.gpsCoords,
+  });
 
-  if (!raw) {
-    console.error('Empty or unrecognized AI response shape:', JSON.stringify(response, null, 2));
-    throw new Error('Empty response from AI model — could not extract content');
-  }
+  let apiResult: Record<string, unknown>;
 
-  let parsed: Record<string, any>;
   try {
-    parsed = extractJsonFromText(raw);
-  } catch (parseErr: any) {
-    console.error('JSON parse failed. Raw AI response:', raw);
-    throw new Error(`Could not parse AI response as JSON: ${parseErr.message}`);
+    const response = await fetch('/api/ai/verify-asset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        imageBase64: imageToSend,
+        textOnly: !imageToSend,
+      }),
+    });
+
+    // ── Safe JSON parsing — never crash on non-JSON ───────────────────────
+    let rawText = '';
+    try {
+      rawText = await response.text();
+    } catch {
+      console.error('[FraudScoring] Could not read response body');
+      return buildFallbackResult(input);
+    }
+
+    if (!rawText.trim()) {
+      console.error('[FraudScoring] Empty response from verify-asset');
+      return buildFallbackResult(input);
+    }
+
+    try {
+      apiResult = JSON.parse(rawText);
+    } catch {
+      console.error('[FraudScoring] Non-JSON response from verify-asset:', rawText.slice(0, 300));
+      return buildFallbackResult(input);
+    }
+
+    // If API returned an error response (not success), use fallback
+    if (!response.ok && !apiResult.isFallback) {
+      console.error('[FraudScoring] verify-asset returned error status:', response.status, apiResult);
+      return buildFallbackResult(input);
+    }
+
+    // If API explicitly returned fallback, keep it as-is (already validated shape)
+    if (apiResult.isFallback) {
+      console.warn('[FraudScoring] AI returned fallback result');
+      return buildFallbackResult(input);
+    }
+
+    console.log('[FraudScoring] AI result received:', {
+      fraudScore: apiResult.fraudScore,
+      riskLevel: apiResult.riskLevel,
+      recommendation: apiResult.recommendation,
+    });
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    console.error('[FraudScoring] Network/fetch error:', errMsg);
+    return buildFallbackResult(input);
   }
 
-  // Validate and apply safe defaults for every field
-  const safeResult: FraudScoringResult = {
-    fraudScore: typeof parsed.fraudScore === 'number' ? Math.min(100, Math.max(0, parsed.fraudScore)) : 50,
-    riskLevel: (['Low', 'Medium', 'High', 'Critical'] as const).includes(parsed.riskLevel)
-      ? parsed.riskLevel as FraudScoringResult['riskLevel']
-      : 'Medium',
-    assetDetected: typeof parsed.assetDetected === 'string' && parsed.assetDetected
-      ? parsed.assetDetected
-      : input.assetCategory,
-    confidenceScore: typeof parsed.confidenceScore === 'number' ? Math.min(100, Math.max(0, parsed.confidenceScore)) : 70,
-    gpsVariance: gpsVarianceText,
-    gpsMatchStatus,
-    ocrInvoiceMatch: typeof parsed.ocrInvoiceMatch === 'string' && parsed.ocrInvoiceMatch
-      ? parsed.ocrInvoiceMatch
-      : 'Not analyzed',
-    ocrMatchStatus: (['Success', 'Partial', 'Failed', 'Not Available'] as const).includes(parsed.ocrMatchStatus)
-      ? parsed.ocrMatchStatus as FraudScoringResult['ocrMatchStatus']
-      : 'Not Available',
-    duplicateCheckStatus: (['Clean', 'Suspicious', 'Duplicate Detected'] as const).includes(parsed.duplicateCheckStatus)
-      ? parsed.duplicateCheckStatus as FraudScoringResult['duplicateCheckStatus']
-      : 'Clean',
-    metadataFlags: Array.isArray(parsed.metadataFlags)
-      ? parsed.metadataFlags.filter((f: any) => typeof f === 'string')
-      : [],
-    summary: typeof parsed.summary === 'string' && parsed.summary
-      ? parsed.summary
-      : 'AI assessment completed. Please review the submission manually.',
-    recommendation: (['Approve', 'Manual Review', 'Reject'] as const).includes(parsed.recommendation)
-      ? parsed.recommendation as FraudScoringResult['recommendation']
-      : 'Manual Review',
-  };
-
-  // Merge computed metadata flags with AI-detected ones (deduplicated)
-  const allFlags = Array.from(new Set([...metadataFlags, ...safeResult.metadataFlags]));
-
-  return { ...safeResult, metadataFlags: allFlags };
+  // ── Validate and sanitize the AI response ─────────────────────────────────
+  return validateResult(apiResult, input, gpsVarianceText, gpsMatchStatus, metadataFlags);
 }
